@@ -32,10 +32,32 @@ class EvaluatorInterface(object):
         raise NotImplementedError
 
     @DeveloperAPI
+    def learn_on_batch(self, samples):
+        """Update policies based on the given batch.
+
+        This is the equivalent to apply_gradients(compute_gradients(samples)),
+        but can be optimized to avoid pulling gradients into CPU memory.
+
+        Either this or the combination of compute/apply grads must be
+        implemented by subclasses.
+
+        Returns:
+            info: dictionary of extra metadata from compute_gradients().
+
+        Examples:
+            >>> batch = ev.sample()
+            >>> ev.learn_on_batch(samples)
+        """
+
+        grads, info = self.compute_gradients(samples)
+        self.apply_gradients(grads)
+        return info
+
+    @DeveloperAPI
     def compute_gradients(self, samples):
         """Returns a gradient computed w.r.t the specified samples.
 
-        This method must be implemented by subclasses.
+        Either this or learn_on_batch() must be implemented by subclasses.
 
         Returns:
             (grads, info): A list of gradients that can be applied on a
@@ -54,7 +76,7 @@ class EvaluatorInterface(object):
     def apply_gradients(self, grads):
         """Applies the given gradients to this evaluator's weights.
 
-        This method must be implemented by subclasses.
+        Either this or learn_on_batch() must be implemented by subclasses.
 
         Examples:
             >>> samples = ev1.sample()
@@ -92,22 +114,6 @@ class EvaluatorInterface(object):
         """
 
         raise NotImplementedError
-
-    @DeveloperAPI
-    def compute_apply(self, samples):
-        """Fused compute gradients and apply gradients call.
-
-        Returns:
-            info: dictionary of extra metadata from compute_gradients().
-
-        Examples:
-            >>> batch = ev.sample()
-            >>> ev.compute_apply(samples)
-        """
-
-        grads, info = self.compute_gradients(samples)
-        self.apply_gradients(grads)
-        return info
 
     @DeveloperAPI
     def get_host(self):

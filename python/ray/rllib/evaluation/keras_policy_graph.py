@@ -43,7 +43,7 @@ class KerasPolicyGraph(PolicyGraph):
         value = self.critic.predict(state)
         return _sample(policy), [], {"vf_preds": value.flatten()}
 
-    def compute_apply(self, batch, *args):
+    def learn_on_batch(self, batch, *args):
         self.actor.fit(
             batch["obs"],
             batch["adv_targets"],
@@ -56,7 +56,7 @@ class KerasPolicyGraph(PolicyGraph):
             epochs=1,
             verbose=0,
             steps_per_epoch=20)
-        return {}, {}
+        return {}
 
     def get_weights(self):
         return [model.get_weights() for model in self.models]

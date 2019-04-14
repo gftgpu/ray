@@ -24,5 +24,11 @@ public interface RayletClient {
   <T> WaitResult<T> wait(List<RayObject<T>> waitFor, int numReturns, int
       timeoutMs, UniqueId currentTaskId);
 
-  void freePlasmaObjects(List<UniqueId> objectIds, boolean localOnly);
+  void freePlasmaObjects(List<UniqueId> objectIds, boolean localOnly, boolean deleteCreatingTasks);
+
+  UniqueId prepareCheckpoint(UniqueId actorId);
+
+  void notifyActorResumedFromCheckpoint(UniqueId actorId, UniqueId checkpointId);
+
+  void destroy();
 }

@@ -39,8 +39,8 @@ class AsyncHyperBandScheduler(FIFOScheduler):
     """
 
     def __init__(self,
-                 time_attr='training_iteration',
-                 reward_attr='episode_reward_mean',
+                 time_attr="training_iteration",
+                 reward_attr="episode_reward_mean",
                  max_t=100,
                  grace_period=10,
                  reduction_factor=3,
@@ -151,7 +151,7 @@ class _Bracket():
         return "Bracket: " + iters
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sched = AsyncHyperBandScheduler(
         grace_period=1, max_t=10, reduction_factor=2)
     print(sched.debug_string())

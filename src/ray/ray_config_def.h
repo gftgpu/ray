@@ -9,8 +9,12 @@
 //     1. You must update the file "ray/python/ray/includes/ray_config.pxd".
 //     2. You must update the file "ray/python/ray/includes/ray_config.pxi".
 
-/// In theory, this is used to detect Ray version mismatches.
-RAY_CONFIG(int64_t, ray_protocol_version, 0x0000000000000000);
+/// In theory, this is used to detect Ray cookie mismatches.
+/// This magic number (hex for "RAY") is used instead of zero, rationale is
+/// that it could still be possible that some random program sends an int64_t
+/// which is zero, but it's much less likely that a program sends this
+/// particular magic number.
+RAY_CONFIG(int64_t, ray_cookie, 0x5241590000000000);
 
 /// The duration that a single handler on the event loop can take before a
 /// warning is logged that the handler is taking too long.
@@ -19,7 +23,7 @@ RAY_CONFIG(int64_t, handler_warning_timeout_ms, 100);
 /// The duration between heartbeats. These are sent by the raylet.
 RAY_CONFIG(int64_t, heartbeat_timeout_milliseconds, 100);
 /// If a component has not sent a heartbeat in the last num_heartbeats_timeout
-/// heartbeat intervals, the global scheduler or monitor process will report
+/// heartbeat intervals, the raylet monitor process will report
 /// it as dead to the db_client table.
 RAY_CONFIG(int64_t, num_heartbeats_timeout, 300);
 /// For a raylet, if the last heartbeat was sent more than this many
@@ -55,29 +59,32 @@ RAY_CONFIG(int64_t, actor_max_dummy_objects, 1000);
 RAY_CONFIG(int64_t, num_connect_attempts, 5);
 RAY_CONFIG(int64_t, connect_timeout_milliseconds, 500);
 
-/// The duration that the local scheduler will wait before reinitiating a
+/// The duration that the raylet will wait before reinitiating a
 /// fetch request for a missing task dependency. This time may adapt based on
 /// the number of missing task dependencies.
-RAY_CONFIG(int64_t, local_scheduler_fetch_timeout_milliseconds, 1000);
-/// The duration that the local scheduler will wait between initiating
+RAY_CONFIG(int64_t, raylet_fetch_timeout_milliseconds, 1000);
+
+/// The duration that the raylet will wait between initiating
 /// reconstruction calls for missing task dependencies. If there are many
 /// missing task dependencies, we will only iniate reconstruction calls for
 /// some of them each time.
-RAY_CONFIG(int64_t, local_scheduler_reconstruction_timeout_milliseconds, 1000);
-/// The maximum number of objects that the local scheduler will issue
+RAY_CONFIG(int64_t, raylet_reconstruction_timeout_milliseconds, 1000);
+
+/// The maximum number of objects that the raylet will issue
 /// reconstruct calls for in a single pass through the reconstruct object
 /// timeout handler.
 RAY_CONFIG(int64_t, max_num_to_reconstruct, 10000);
+
 /// The maximum number of objects to include in a single fetch request in the
-/// regular local scheduler fetch timeout handler.
-RAY_CONFIG(int64_t, local_scheduler_fetch_request_size, 10000);
+/// regular raylet fetch timeout handler.
+RAY_CONFIG(int64_t, raylet_fetch_request_size, 10000);
 
 /// The duration that we wait after sending a worker SIGTERM before sending
 /// the worker SIGKILL.
 RAY_CONFIG(int64_t, kill_worker_timeout_milliseconds, 100);
 
-/// This is a timeout used to cause failures in the plasma manager and local
-/// scheduler when certain event loop handlers take too long.
+/// This is a timeout used to cause failures in the plasma manager and raylet
+/// when certain event loop handlers take too long.
 RAY_CONFIG(int64_t, max_time_for_handler_milliseconds, 1000);
 
 /// This is used by the Python extension when serializing objects as part of
@@ -135,3 +142,12 @@ RAY_CONFIG(int, num_workers_per_process, 1);
 
 /// Maximum timeout in milliseconds within which a task lease must be renewed.
 RAY_CONFIG(int64_t, max_task_lease_timeout_ms, 60000);
+
+/// Maximum number of checkpoints to keep in GCS for an actor.
+/// Note: this number should be set to at least 2. Because saving a application
+/// checkpoint isn't atomic with saving the backend checkpoint, and it will break
+/// if this number is set to 1 and users save application checkpoints in place.
+RAY_CONFIG(uint32_t, num_actor_checkpoints_to_keep, 20);
+
+/// Maximum number of ids in one batch to send to GCS to delete keys.
+RAY_CONFIG(uint32_t, maximum_gcs_deletion_batch_size, 1000);

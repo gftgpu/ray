@@ -43,7 +43,7 @@ class RemoteFunction(object):
         self._function = function
         self._function_descriptor = FunctionDescriptor.from_function(function)
         self._function_name = (
-            self._function.__module__ + '.' + self._function.__name__)
+            self._function.__module__ + "." + self._function.__name__)
         self._num_cpus = (DEFAULT_REMOTE_FUNCTION_CPUS
                           if num_cpus is None else num_cpus)
         self._num_gpus = num_gpus
@@ -57,8 +57,10 @@ class RemoteFunction(object):
         self._function_signature = ray.signature.extract_signature(
             self._function)
 
-        # # Export the function.
+        # Export the function.
         worker = ray.worker.get_global_worker()
+        # In which session this function was exported last time.
+        self._last_export_session = worker._session_index
         worker.function_actor_manager.export(self)
 
     def __call__(self, *args, **kwargs):
@@ -97,7 +99,15 @@ class RemoteFunction(object):
         """An experimental alternate way to submit remote functions."""
         worker = ray.worker.get_global_worker()
         worker.check_connected()
+
+        if self._last_export_session < worker._session_index:
+            # If this function was exported in a previous session, we need to
+            # export this function again, because current GCS doesn't have it.
+            self._last_export_session = worker._session_index
+            worker.function_actor_manager.export(self)
+
         kwargs = {} if kwargs is None else kwargs
+        args = [] if args is None else args
         args = ray.signature.extend_args(self._function_signature, args,
                                          kwargs)
 

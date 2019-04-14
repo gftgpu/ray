@@ -5,6 +5,7 @@ from __future__ import print_function
 import random
 
 import ray
+from ray.rllib.evaluation.metrics import get_learner_stats
 from ray.rllib.optimizers.policy_optimizer import PolicyOptimizer
 from ray.rllib.evaluation.sample_batch import SampleBatch, DEFAULT_POLICY_ID, \
     MultiAgentBatch
@@ -17,11 +18,14 @@ class SyncBatchReplayOptimizer(PolicyOptimizer):
 
     This enables RNN support. Does not currently support prioritization."""
 
-    @override(PolicyOptimizer)
-    def _init(self,
-              learning_starts=1000,
-              buffer_size=10000,
-              train_batch_size=32):
+    def __init__(self,
+                 local_evaluator,
+                 remote_evaluators,
+                 learning_starts=1000,
+                 buffer_size=10000,
+                 train_batch_size=32):
+        PolicyOptimizer.__init__(self, local_evaluator, remote_evaluators)
+
         self.replay_starts = learning_starts
         self.max_buffer_size = buffer_size
         self.train_batch_size = train_batch_size
@@ -95,10 +99,9 @@ class SyncBatchReplayOptimizer(PolicyOptimizer):
             samples.append(random.choice(self.replay_buffer))
         samples = SampleBatch.concat_samples(samples)
         with self.grad_timer:
-            info_dict = self.local_evaluator.compute_apply(samples)
+            info_dict = self.local_evaluator.learn_on_batch(samples)
             for policy_id, info in info_dict.items():
-                if "stats" in info:
-                    self.learner_stats[policy_id] = info["stats"]
+                self.learner_stats[policy_id] = get_learner_stats(info)
             self.grad_timer.push_units_processed(samples.count)
         self.num_steps_trained += samples.count
         return info_dict

@@ -16,10 +16,9 @@ import ray.cloudpickle as pickle
 import ray.gcs_utils
 import ray.utils
 import ray.ray_constants as ray_constants
-from ray.services import get_ip_address, get_port
-from ray.utils import binary_to_hex, binary_to_object_id, hex_to_binary
+from ray.utils import (binary_to_hex, binary_to_object_id, hex_to_binary,
+                       setup_logger)
 
-# Set up logging.
 logger = logging.getLogger(__name__)
 
 
@@ -32,27 +31,23 @@ class Monitor(object):
 
     Attributes:
         redis: A connection to the Redis server.
-        subscribe_client: A pubsub client for the Redis server. This is used to
-            receive notifications about failed components.
+        primary_subscribe_client: A pubsub client for the Redis server.
+            This is used to receive notifications about failed components.
     """
 
-    def __init__(self,
-                 redis_address,
-                 redis_port,
-                 autoscaling_config,
-                 redis_password=None):
+    def __init__(self, redis_address, autoscaling_config, redis_password=None):
         # Initialize the Redis clients.
         self.state = ray.experimental.state.GlobalState()
         self.state._initialize_global_state(
-            redis_address, redis_port, redis_password=redis_password)
-        self.redis = redis.StrictRedis(
-            host=redis_address, port=redis_port, db=0, password=redis_password)
+            args.redis_address, redis_password=redis_password)
+        self.redis = ray.services.create_redis_client(
+            redis_address, password=redis_password)
         # Setup subscriptions to the primary Redis server and the Redis shards.
         self.primary_subscribe_client = self.redis.pubsub(
             ignore_subscribe_messages=True)
-        # Keep a mapping from local scheduler client ID to IP address to use
+        # Keep a mapping from raylet client ID to IP address to use
         # for updating the load metrics.
-        self.local_scheduler_id_to_ip_map = {}
+        self.raylet_id_to_ip_map = {}
         self.load_metrics = LoadMetrics()
         if autoscaling_config:
             self.autoscaler = StandardAutoscaler(autoscaling_config,
@@ -68,8 +63,10 @@ class Monitor(object):
             # that redis server.
             addr_port = self.redis.lrange("RedisShards", 0, -1)
             if len(addr_port) > 1:
-                logger.warning("TODO: if launching > 1 redis shard, flushing "
-                               "needs to touch shards in parallel.")
+                logger.warning(
+                    "Monitor: "
+                    "TODO: if launching > 1 redis shard, flushing needs to "
+                    "touch shards in parallel.")
                 self.issue_gcs_flushes = False
             else:
                 addr_port = addr_port[0].split(b":")
@@ -81,9 +78,15 @@ class Monitor(object):
                     self.redis_shard.execute_command("HEAD.FLUSH 0")
                 except redis.exceptions.ResponseError as e:
                     logger.info(
+                        "Monitor: "
                         "Turning off flushing due to exception: {}".format(
                             str(e)))
                     self.issue_gcs_flushes = False
+
+    def __del__(self):
+        """Destruct the monitor object."""
+        # We close the pubsub client to avoid leaking file descriptors.
+        self.primary_subscribe_client.close()
 
     def subscribe(self, channel):
         """Subscribe to the given channel on the primary Redis shard.
@@ -120,15 +123,16 @@ class Monitor(object):
                 static_resources[static] = (
                     heartbeat_message.ResourcesTotalCapacity(i))
 
-            # Update the load metrics for this local scheduler.
+            # Update the load metrics for this raylet.
             client_id = ray.utils.binary_to_hex(heartbeat_message.ClientId())
-            ip = self.local_scheduler_id_to_ip_map.get(client_id)
+            ip = self.raylet_id_to_ip_map.get(client_id)
             if ip:
                 self.load_metrics.update(ip, static_resources,
                                          dynamic_resources)
             else:
-                print("Warning: could not find ip for client {} in {}.".format(
-                    client_id, self.local_scheduler_id_to_ip_map))
+                logger.warning(
+                    "Monitor: "
+                    "could not find ip for client {}".format(client_id))
 
     def _xray_clean_up_entries_for_driver(self, driver_id):
         """Remove this driver's object/task entries from redis.
@@ -184,11 +188,14 @@ class Monitor(object):
                 continue
             redis = self.state.redis_clients[shard_index]
             num_deleted = redis.delete(*keys)
-            logger.info("Removed {} dead redis entries of the driver from"
-                        " redis shard {}.".format(num_deleted, shard_index))
+            logger.info("Monitor: "
+                        "Removed {} dead redis entries of the "
+                        "driver from redis shard {}.".format(
+                            num_deleted, shard_index))
             if num_deleted != len(keys):
-                logger.warning("Failed to remove {} relevant redis entries"
-                               " from redis shard {}.".format(
+                logger.warning("Monitor: "
+                               "Failed to remove {} relevant redis "
+                               "entries from redis shard {}.".format(
                                    len(keys) - num_deleted, shard_index))
 
     def xray_driver_removed_handler(self, unused_channel, data):
@@ -204,8 +211,9 @@ class Monitor(object):
         message = ray.gcs_utils.DriverTableData.GetRootAsDriverTableData(
             driver_data, 0)
         driver_id = message.DriverId()
-        logger.info("XRay Driver {} has been removed.".format(
-            binary_to_hex(driver_id)))
+        logger.info("Monitor: "
+                    "XRay Driver {} has been removed.".format(
+                        binary_to_hex(driver_id)))
         self._xray_clean_up_entries_for_driver(driver_id)
 
     def process_messages(self, max_messages=10000):
@@ -231,9 +239,8 @@ class Monitor(object):
                 data = message["data"]
 
                 # Determine the appropriate message handler.
-                message_handler = None
                 if channel == ray.gcs_utils.XRAY_HEARTBEAT_BATCH_CHANNEL:
-                    # Similar functionality as local scheduler info channel
+                    # Similar functionality as raylet info channel
                     message_handler = self.xray_heartbeat_batch_handler
                 elif channel == ray.gcs_utils.XRAY_DRIVER_CHANNEL:
                     # Handles driver death.
@@ -242,19 +249,17 @@ class Monitor(object):
                     raise Exception("This code should be unreachable.")
 
                 # Call the handler.
-                assert (message_handler is not None)
                 message_handler(channel, data)
 
-    def update_local_scheduler_map(self):
-        local_schedulers = self.state.client_table()
-        self.local_scheduler_id_to_ip_map = {}
-        for local_scheduler_info in local_schedulers:
-            client_id = local_scheduler_info.get("DBClientID") or \
-                local_scheduler_info["ClientID"]
-            ip_address = (
-                local_scheduler_info.get("AuxAddress")
-                or local_scheduler_info["NodeManagerAddress"]).split(":")[0]
-            self.local_scheduler_id_to_ip_map[client_id] = ip_address
+    def update_raylet_map(self):
+        all_raylet_nodes = self.state.client_table()
+        self.raylet_id_to_ip_map = {}
+        for raylet_info in all_raylet_nodes:
+            client_id = (raylet_info.get("DBClientID")
+                         or raylet_info["ClientID"])
+            ip_address = (raylet_info.get("AuxAddress")
+                          or raylet_info["NodeManagerAddress"]).split(":")[0]
+            self.raylet_id_to_ip_map[client_id] = ip_address
 
     def _maybe_flush_gcs(self):
         """Experimental: issue a flush request to the GCS.
@@ -280,7 +285,7 @@ class Monitor(object):
         max_entries_to_flush = self.gcs_flush_policy.num_entries_to_flush()
         num_flushed = self.redis_shard.execute_command(
             "HEAD.FLUSH {}".format(max_entries_to_flush))
-        logger.info("num_flushed {}".format(num_flushed))
+        logger.info("Monitor: num_flushed {}".format(num_flushed))
 
         # This flushes event log and log files.
         ray.experimental.flush_redis_unsafe(self.redis)
@@ -302,9 +307,9 @@ class Monitor(object):
 
         # Handle messages from the subscription channels.
         while True:
-            # Update the mapping from local scheduler client ID to IP address.
+            # Update the mapping from raylet client ID to IP address.
             # This is only used to update the load metrics for the autoscaler.
-            self.update_local_scheduler_map()
+            self.update_raylet_map()
 
             # Process autoscaling actions
             if self.autoscaler:
@@ -358,11 +363,7 @@ if __name__ == "__main__":
         default=ray_constants.LOGGER_FORMAT,
         help=ray_constants.LOGGER_FORMAT_HELP)
     args = parser.parse_args()
-    level = logging.getLevelName(args.logging_level.upper())
-    logging.basicConfig(level=level, format=args.logging_format)
-
-    redis_ip_address = get_ip_address(args.redis_address)
-    redis_port = get_port(args.redis_address)
+    setup_logger(args.logging_level, args.logging_format)
 
     if args.autoscaling_config:
         autoscaling_config = os.path.expanduser(args.autoscaling_config)
@@ -370,8 +371,7 @@ if __name__ == "__main__":
         autoscaling_config = None
 
     monitor = Monitor(
-        redis_ip_address,
-        redis_port,
+        args.redis_address,
         autoscaling_config,
         redis_password=args.redis_password)
 
@@ -379,10 +379,8 @@ if __name__ == "__main__":
         monitor.run()
     except Exception as e:
         # Something went wrong, so push an error to all drivers.
-        redis_client = redis.StrictRedis(
-            host=redis_ip_address,
-            port=redis_port,
-            password=args.redis_password)
+        redis_client = ray.services.create_redis_client(
+            args.redis_address, password=args.redis_password)
         traceback_str = ray.utils.format_error_message(traceback.format_exc())
         message = "The monitor failed with the following error:\n{}".format(
             traceback_str)

@@ -6,15 +6,18 @@ import tensorflow as tf
 
 import ray
 from ray.rllib.models import ModelCatalog
-from ray.rllib.evaluation.postprocessing import compute_advantages
+from ray.rllib.evaluation.postprocessing import compute_advantages, \
+    Postprocessing
+from ray.rllib.evaluation.sample_batch import SampleBatch
+from ray.rllib.evaluation.metrics import LEARNER_STATS_KEY
 from ray.rllib.utils.annotations import override
 from ray.rllib.evaluation.policy_graph import PolicyGraph
 from ray.rllib.evaluation.tf_policy_graph import TFPolicyGraph
 from ray.rllib.agents.dqn.dqn_policy_graph import _scope_vars
 from ray.rllib.utils.explained_variance import explained_variance
 
-P_SCOPE = "p_func"
-V_SCOPE = "v_func"
+POLICY_SCOPE = "p_func"
+VALUE_SCOPE = "v_func"
 
 
 class ValueLoss(object):
@@ -52,98 +55,8 @@ class ReweightedImitationLoss(object):
             tf.stop_gradient(exp_advs) * logprobs)
 
 
-class MARWILPolicyGraph(TFPolicyGraph):
-    def __init__(self, observation_space, action_space, config):
-        config = dict(ray.rllib.agents.dqn.dqn.DEFAULT_CONFIG, **config)
-        self.config = config
-
-        dist_cls, logit_dim = ModelCatalog.get_action_dist(
-            action_space, self.config["model"])
-
-        # Action inputs
-        self.obs_t = tf.placeholder(
-            tf.float32, shape=(None, ) + observation_space.shape)
-
-        with tf.variable_scope(P_SCOPE) as scope:
-            self.model = self._build_policy_network(
-                self.obs_t, observation_space, logit_dim)
-            logits = self.model.outputs
-            self.p_func_vars = _scope_vars(scope.name)
-
-        # Action outputs
-        action_dist = dist_cls(logits)
-        self.output_actions = action_dist.sample()
-
-        # Training inputs
-        self.act_t = tf.placeholder(tf.int32, [None], name="action")
-        self.cum_rew_t = tf.placeholder(tf.float32, [None], name="reward")
-
-        # v network evaluation
-        with tf.variable_scope(V_SCOPE) as scope:
-            state_values = self._build_value_network(self.obs_t,
-                                                     observation_space)
-            self.v_func_vars = _scope_vars(scope.name)
-        self.v_loss = self._build_value_loss(state_values, self.cum_rew_t)
-        self.p_loss = self._build_policy_loss(state_values, self.cum_rew_t,
-                                              logits, self.act_t, action_space)
-
-        # which kind of objective to optimize
-        objective = (
-            self.p_loss.loss + self.config["vf_coeff"] * self.v_loss.loss)
-        self.explained_variance = tf.reduce_mean(
-            explained_variance(self.cum_rew_t, state_values))
-
-        # initialize TFPolicyGraph
-        self.sess = tf.get_default_session()
-        self.loss_inputs = [
-            ("obs", self.obs_t),
-            ("actions", self.act_t),
-            ("advantages", self.cum_rew_t),
-        ]
-        TFPolicyGraph.__init__(
-            self,
-            observation_space,
-            action_space,
-            self.sess,
-            obs_input=self.obs_t,
-            action_sampler=self.output_actions,
-            loss=self.model.loss() + objective,
-            loss_inputs=self.loss_inputs,
-            state_inputs=self.model.state_in,
-            state_outputs=self.model.state_out)
-        self.sess.run(tf.global_variables_initializer())
-
-        self.stats_fetches = {
-            "total_loss": objective,
-            "vf_explained_var": self.explained_variance,
-            "policy_loss": self.p_loss.loss,
-            "vf_loss": self.v_loss.loss
-        }
-
-    def _build_policy_network(self, obs, obs_space, logit_dim):
-        return ModelCatalog.get_model({
-            "obs": obs,
-            "is_training": self._get_is_training_placeholder(),
-        }, obs_space, logit_dim, self.config["model"])
-
-    def _build_value_network(self, obs, obs_space):
-        value_model = ModelCatalog.get_model({
-            "obs": obs,
-            "is_training": self._get_is_training_placeholder(),
-        }, obs_space, 1, self.config["model"])
-        return value_model.outputs
-
-    def _build_value_loss(self, state_values, cum_rwds):
-        return ValueLoss(state_values, cum_rwds)
-
-    def _build_policy_loss(self, state_values, cum_rwds, logits, actions,
-                           action_space):
-        return ReweightedImitationLoss(state_values, cum_rwds, logits, actions,
-                                       action_space, self.config["beta"])
-
-    @override(TFPolicyGraph)
-    def extra_compute_grad_fetches(self):
-        return self.stats_fetches
+class MARWILPostprocessing(object):
+    """Adds the advantages field to the trajectory."""
 
     @override(PolicyGraph)
     def postprocess_trajectory(self,
@@ -158,10 +71,103 @@ class MARWILPolicyGraph(TFPolicyGraph):
                 "last done mask in a batch should be True. "
                 "For now, we only support reading experience batches produced "
                 "with batch_mode='complete_episodes'.",
-                len(sample_batch["dones"]), sample_batch["dones"][-1])
+                len(sample_batch[SampleBatch.DONES]),
+                sample_batch[SampleBatch.DONES][-1])
         batch = compute_advantages(
             sample_batch, last_r, gamma=self.config["gamma"], use_gae=False)
         return batch
+
+
+class MARWILPolicyGraph(MARWILPostprocessing, TFPolicyGraph):
+    def __init__(self, observation_space, action_space, config):
+        config = dict(ray.rllib.agents.dqn.dqn.DEFAULT_CONFIG, **config)
+        self.config = config
+
+        dist_cls, logit_dim = ModelCatalog.get_action_dist(
+            action_space, self.config["model"])
+
+        # Action inputs
+        self.obs_t = tf.placeholder(
+            tf.float32, shape=(None, ) + observation_space.shape)
+        prev_actions_ph = ModelCatalog.get_action_placeholder(action_space)
+        prev_rewards_ph = tf.placeholder(
+            tf.float32, [None], name="prev_reward")
+
+        with tf.variable_scope(POLICY_SCOPE) as scope:
+            self.model = ModelCatalog.get_model({
+                "obs": self.obs_t,
+                "prev_actions": prev_actions_ph,
+                "prev_rewards": prev_rewards_ph,
+                "is_training": self._get_is_training_placeholder(),
+            }, observation_space, action_space, logit_dim,
+                                                self.config["model"])
+            logits = self.model.outputs
+            self.p_func_vars = _scope_vars(scope.name)
+
+        # Action outputs
+        action_dist = dist_cls(logits)
+        self.output_actions = action_dist.sample()
+
+        # Training inputs
+        self.act_t = tf.placeholder(tf.int32, [None], name="action")
+        self.cum_rew_t = tf.placeholder(tf.float32, [None], name="reward")
+
+        # v network evaluation
+        with tf.variable_scope(VALUE_SCOPE) as scope:
+            state_values = self.model.value_function()
+            self.v_func_vars = _scope_vars(scope.name)
+        self.v_loss = self._build_value_loss(state_values, self.cum_rew_t)
+        self.p_loss = self._build_policy_loss(state_values, self.cum_rew_t,
+                                              logits, self.act_t, action_space)
+
+        # which kind of objective to optimize
+        objective = (
+            self.p_loss.loss + self.config["vf_coeff"] * self.v_loss.loss)
+        self.explained_variance = tf.reduce_mean(
+            explained_variance(self.cum_rew_t, state_values))
+
+        # initialize TFPolicyGraph
+        self.sess = tf.get_default_session()
+        self.loss_inputs = [
+            (SampleBatch.CUR_OBS, self.obs_t),
+            (SampleBatch.ACTIONS, self.act_t),
+            (Postprocessing.ADVANTAGES, self.cum_rew_t),
+        ]
+        TFPolicyGraph.__init__(
+            self,
+            observation_space,
+            action_space,
+            self.sess,
+            obs_input=self.obs_t,
+            action_sampler=self.output_actions,
+            action_prob=action_dist.sampled_action_prob(),
+            loss=objective,
+            model=self.model,
+            loss_inputs=self.loss_inputs,
+            state_inputs=self.model.state_in,
+            state_outputs=self.model.state_out,
+            prev_action_input=prev_actions_ph,
+            prev_reward_input=prev_rewards_ph)
+        self.sess.run(tf.global_variables_initializer())
+
+        self.stats_fetches = {
+            "total_loss": objective,
+            "vf_explained_var": self.explained_variance,
+            "policy_loss": self.p_loss.loss,
+            "vf_loss": self.v_loss.loss
+        }
+
+    def _build_value_loss(self, state_values, cum_rwds):
+        return ValueLoss(state_values, cum_rwds)
+
+    def _build_policy_loss(self, state_values, cum_rwds, logits, actions,
+                           action_space):
+        return ReweightedImitationLoss(state_values, cum_rwds, logits, actions,
+                                       action_space, self.config["beta"])
+
+    @override(TFPolicyGraph)
+    def extra_compute_grad_fetches(self):
+        return {LEARNER_STATS_KEY: self.stats_fetches}
 
     @override(PolicyGraph)
     def get_initial_state(self):

@@ -65,7 +65,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    api.rst
    actors.rst
    using-ray-with-gpus.rst
-   webui.rst
+   signals.rst
    async_api.rst
 
 .. toctree::
@@ -93,12 +93,13 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    rllib.rst
    rllib-training.rst
    rllib-env.rst
-   rllib-algorithms.rst
    rllib-models.rst
+   rllib-algorithms.rst
    rllib-offline.rst
    rllib-dev.rst
    rllib-concepts.rst
    rllib-package-ref.rst
+   rllib-examples.rst
 
 .. toctree::
    :maxdepth: 1
@@ -114,6 +115,7 @@ Ray comes with libraries that accelerate deep learning and reinforcement learnin
    example-rl-pong.rst
    example-policy-gradient.rst
    example-parameter-server.rst
+   example-newsreader.rst
    example-resnet.rst
    example-a3c.rst
    example-lbfgs.rst

@@ -3,14 +3,19 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import errno
 import logging
 import tensorflow as tf
 import numpy as np
 
 import ray
+import ray.experimental.tf_utils
+from ray.rllib.evaluation.metrics import LEARNER_STATS_KEY
 from ray.rllib.evaluation.policy_graph import PolicyGraph
+from ray.rllib.evaluation.sample_batch import SampleBatch
 from ray.rllib.models.lstm import chop_into_sequences
 from ray.rllib.utils.annotations import override, DeveloperAPI
+from ray.rllib.utils.debug import log_once, summarize
 from ray.rllib.utils.schedules import ConstantSchedule, PiecewiseSchedule
 from ray.rllib.utils.tf_run_builder import TFRunBuilder
 
@@ -30,6 +35,7 @@ class TFPolicyGraph(PolicyGraph):
     Attributes:
         observation_space (gym.Space): observation space of the policy.
         action_space (gym.Space): action space of the policy.
+        model (rllib.models.Model): RLlib model used for the policy.
 
     Examples:
         >>> policy = TFPolicyGraphSubclass(
@@ -51,6 +57,8 @@ class TFPolicyGraph(PolicyGraph):
                  action_sampler,
                  loss,
                  loss_inputs,
+                 model=None,
+                 action_prob=None,
                  state_inputs=None,
                  state_outputs=None,
                  prev_action_input=None,
@@ -76,6 +84,9 @@ class TFPolicyGraph(PolicyGraph):
                 and has shape [BATCH_SIZE, data...]. These keys will be read
                 from postprocessed sample batches and fed into the specified
                 placeholders during loss computation.
+            model (rllib.models.Model): used to integrate custom losses and
+                stats from user-defined RLlib models.
+            action_prob (Tensor): probability of the sampled action.
             state_inputs (list): list of RNN state input Tensors.
             state_outputs (list): list of RNN state output Tensors.
             prev_action_input (Tensor): placeholder for previous actions
@@ -94,15 +105,16 @@ class TFPolicyGraph(PolicyGraph):
 
         self.observation_space = observation_space
         self.action_space = action_space
+        self.model = model
         self._sess = sess
         self._obs_input = obs_input
         self._prev_action_input = prev_action_input
         self._prev_reward_input = prev_reward_input
         self._sampler = action_sampler
-        self._loss = loss
         self._loss_inputs = loss_inputs
         self._loss_input_dict = dict(self._loss_inputs)
         self._is_training = self._get_is_training_placeholder()
+        self._action_prob = action_prob
         self._state_inputs = state_inputs or []
         self._state_outputs = state_outputs or []
         for i, ph in enumerate(self._state_inputs):
@@ -111,12 +123,20 @@ class TFPolicyGraph(PolicyGraph):
         self._max_seq_len = max_seq_len
         self._batch_divisibility_req = batch_divisibility_req
 
+        if self.model:
+            self._loss = self.model.custom_loss(loss, self._loss_input_dict)
+            self._stats_fetches = {"model": self.model.custom_stats()}
+        else:
+            self._loss = loss
+            self._stats_fetches = {}
+
         self._optimizer = self.optimizer()
-        self._grads_and_vars = [(g, v)
-                                for (g, v) in self.gradients(self._optimizer)
-                                if g is not None]
+        self._grads_and_vars = [
+            (g, v) for (g, v) in self.gradients(self._optimizer, self._loss)
+            if g is not None
+        ]
         self._grads = [g for (g, v) in self._grads_and_vars]
-        self._variables = ray.experimental.TensorFlowVariables(
+        self._variables = ray.experimental.tf_utils.TensorFlowVariables(
             self._loss, self._sess)
 
         # gather update ops for any batch norm layers
@@ -129,10 +149,8 @@ class TFPolicyGraph(PolicyGraph):
             logger.debug("Update ops to run on apply gradient: {}".format(
                 self._update_ops))
         with tf.control_dependencies(self._update_ops):
-            # specify global_step for TD3 which needs to count the num updates
-            self._apply_op = self._optimizer.apply_gradients(
-                self._grads_and_vars,
-                global_step=tf.train.get_or_create_global_step())
+            self._apply_op = self.build_apply_op(self._optimizer,
+                                                 self._grads_and_vars)
 
         if len(self._state_inputs) != len(self._state_outputs):
             raise ValueError(
@@ -175,12 +193,12 @@ class TFPolicyGraph(PolicyGraph):
     def apply_gradients(self, gradients):
         builder = TFRunBuilder(self._sess, "apply_gradients")
         fetches = self._build_apply_gradients(builder, gradients)
-        return builder.get(fetches)
+        builder.get(fetches)
 
     @override(PolicyGraph)
-    def compute_apply(self, postprocessed_batch):
-        builder = TFRunBuilder(self._sess, "compute_apply")
-        fetches = self._build_compute_apply(builder, postprocessed_batch)
+    def learn_on_batch(self, postprocessed_batch):
+        builder = TFRunBuilder(self._sess, "learn_on_batch")
+        fetches = self._build_learn_on_batch(builder, postprocessed_batch)
         return builder.get(fetches)
 
     @override(PolicyGraph)
@@ -205,6 +223,12 @@ class TFPolicyGraph(PolicyGraph):
     @override(PolicyGraph)
     def export_checkpoint(self, export_dir, filename_prefix="model"):
         """Export tensorflow checkpoint to export_dir."""
+        try:
+            os.makedirs(export_dir)
+        except OSError as e:
+            # ignore error if export dir already exists
+            if e.errno != errno.EEXIST:
+                raise
         save_path = os.path.join(export_dir, filename_prefix)
         with self._sess.graph.as_default():
             saver = tf.train.Saver()
@@ -224,8 +248,14 @@ class TFPolicyGraph(PolicyGraph):
 
     @DeveloperAPI
     def extra_compute_action_fetches(self):
-        """Extra values to fetch and return from compute_actions()."""
-        return {}  # e.g, value function
+        """Extra values to fetch and return from compute_actions().
+
+        By default we only return action probability info (if present).
+        """
+        if self._action_prob is not None:
+            return {"action_prob": self._action_prob}
+        else:
+            return {}
 
     @DeveloperAPI
     def extra_compute_grad_feed_dict(self):
@@ -235,17 +265,7 @@ class TFPolicyGraph(PolicyGraph):
     @DeveloperAPI
     def extra_compute_grad_fetches(self):
         """Extra values to fetch and return from compute_gradients()."""
-        return {}  # e.g, td error
-
-    @DeveloperAPI
-    def extra_apply_grad_feed_dict(self):
-        """Extra dict to pass to the apply gradients session run."""
-        return {}
-
-    @DeveloperAPI
-    def extra_apply_grad_fetches(self):
-        """Extra values to fetch and return from apply_gradients()."""
-        return {}  # e.g., batch norm updates
+        return {LEARNER_STATS_KEY: {}}  # e.g, stats, td error, etc.
 
     @DeveloperAPI
     def optimizer(self):
@@ -253,9 +273,18 @@ class TFPolicyGraph(PolicyGraph):
         return tf.train.AdamOptimizer()
 
     @DeveloperAPI
-    def gradients(self, optimizer):
+    def gradients(self, optimizer, loss):
         """Override for custom gradient computation."""
-        return optimizer.compute_gradients(self._loss)
+        return optimizer.compute_gradients(loss)
+
+    @DeveloperAPI
+    def build_apply_op(self, optimizer, grads_and_vars):
+        """Override for custom gradient apply computation."""
+
+        # specify global_step for TD3 which needs to count the num updates
+        return optimizer.apply_gradients(
+            self._grads_and_vars,
+            global_step=tf.train.get_or_create_global_step())
 
     @DeveloperAPI
     def _get_is_training_placeholder(self):
@@ -358,7 +387,7 @@ class TFPolicyGraph(PolicyGraph):
         builder.add_feed_dict({self._is_training: True})
         builder.add_feed_dict(self._get_loss_inputs_dict(postprocessed_batch))
         fetches = builder.add_fetches(
-            [self._grads, self.extra_compute_grad_fetches()])
+            [self._grads, self._get_grad_and_stats_fetches()])
         return fetches[0], fetches[1]
 
     def _build_apply_gradients(self, builder, gradients):
@@ -366,31 +395,38 @@ class TFPolicyGraph(PolicyGraph):
             raise ValueError(
                 "Unexpected number of gradients to apply, got {} for {}".
                 format(gradients, self._grads))
-        builder.add_feed_dict(self.extra_apply_grad_feed_dict())
         builder.add_feed_dict({self._is_training: True})
         builder.add_feed_dict(dict(zip(self._grads, gradients)))
-        fetches = builder.add_fetches(
-            [self._apply_op, self.extra_apply_grad_fetches()])
-        return fetches[1]
+        fetches = builder.add_fetches([self._apply_op])
+        return fetches[0]
 
-    def _build_compute_apply(self, builder, postprocessed_batch):
+    def _build_learn_on_batch(self, builder, postprocessed_batch):
         builder.add_feed_dict(self.extra_compute_grad_feed_dict())
-        builder.add_feed_dict(self.extra_apply_grad_feed_dict())
         builder.add_feed_dict(self._get_loss_inputs_dict(postprocessed_batch))
         builder.add_feed_dict({self._is_training: True})
         fetches = builder.add_fetches([
             self._apply_op,
-            self.extra_compute_grad_fetches(),
-            self.extra_apply_grad_fetches()
+            self._get_grad_and_stats_fetches(),
         ])
-        return fetches[1], fetches[2]
+        return fetches[1]
+
+    def _get_grad_and_stats_fetches(self):
+        fetches = self.extra_compute_grad_fetches()
+        if LEARNER_STATS_KEY not in fetches:
+            raise ValueError(
+                "Grad fetches should contain 'stats': {...} entry")
+        if self._stats_fetches:
+            fetches[LEARNER_STATS_KEY] = dict(self._stats_fetches,
+                                              **fetches[LEARNER_STATS_KEY])
+        return fetches
 
     def _get_loss_inputs_dict(self, batch):
         feed_dict = {}
         if self._batch_divisibility_req > 1:
             meets_divisibility_reqs = (
-                len(batch["obs"]) % self._batch_divisibility_req == 0
-                and max(batch["agent_index"]) == 0)  # not multiagent
+                len(batch[SampleBatch.CUR_OBS]) %
+                self._batch_divisibility_req == 0
+                and max(batch[SampleBatch.AGENT_INDEX]) == 0)  # not multiagent
         else:
             meets_divisibility_reqs = True
 
@@ -413,8 +449,9 @@ class TFPolicyGraph(PolicyGraph):
             "state_in_{}".format(i) for i in range(len(self._state_inputs))
         ]
         feature_sequences, initial_states, seq_lens = chop_into_sequences(
-            batch["eps_id"],
-            batch["agent_index"], [batch[k] for k in feature_keys],
+            batch[SampleBatch.EPS_ID],
+            batch[SampleBatch.UNROLL_ID],
+            batch[SampleBatch.AGENT_INDEX], [batch[k] for k in feature_keys],
             [batch[k] for k in state_keys],
             max_seq_len,
             dynamic_max=dynamic_max)
@@ -423,6 +460,15 @@ class TFPolicyGraph(PolicyGraph):
         for k, v in zip(state_keys, initial_states):
             feed_dict[self._loss_input_dict[k]] = v
         feed_dict[self._seq_lens] = seq_lens
+
+        if log_once("rnn_feed_dict"):
+            logger.info("Padded input for RNN:\n\n{}\n".format(
+                summarize({
+                    "features": feature_sequences,
+                    "initial_states": initial_states,
+                    "seq_lens": seq_lens,
+                    "max_seq_len": max_seq_len,
+                })))
         return feed_dict
 
 
